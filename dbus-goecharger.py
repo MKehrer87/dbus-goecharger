@@ -113,7 +113,7 @@ class DbusGoeChargerService:
     gobject.timeout_add(self._getSignOfLifeInterval()*60*1000, self._signOfLife)
  
   def _getConfig(self):
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(strict=False)
     config.read("%s/config.ini" % (os.path.dirname(os.path.realpath(__file__))))
     return config
  
@@ -198,6 +198,7 @@ class DbusGoeChargerService:
     logging.info("Last _update() call: %s" % (self._lastUpdate))
     logging.info("Last '/Ac/Power': %s" % (self._dbusservice['/Ac/Power']))
     logging.info("Last '/Mode': %s" % (self._dbusservice['/Mode']))
+    logging.info("Last '/SetCurrent': %s" % (self._dbusservice['/SetCurrent']))
     logging.info("--- End: sign of life ---")
     return True
   
@@ -270,7 +271,152 @@ class DbusGoeChargerService:
             count = count+1
         
         return count
-        
+	
+  def getPowerWallbox(self, current): 
+    return current*230*self._lastNumberOfPhases
+	
+	
+  def getPowerWallboxUp(self, current): 
+    return -1.0*(self.getPowerWallbox(current)+200)
+
+  def getPowerWallboxDown(self, current): 
+    return -1.0*(self.getPowerWallbox(current)-200)
+
+  def _updatePVsurplusCharging(self, powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent):
+    border = 60
+    debug = False
+    power = powerGrid - powerWallbox
+		
+    if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
+    	power = power + (self._maxPowerUnloadBatteryDuringCharging - powerBattery)
+    if powerBatteryExt < -self._maxPowerUnloadBatteryDuringChargingExt:
+    	power = power + (self._maxPowerUnloadBatteryDuringChargingExt - powerBatteryExt)
+
+    if debug: 
+    	print("Update _pvCount=",self._pvOverloadCount,"-",self._pvUnderloadCount," W power=",power," W (up ",self.getPowerWallboxUp(current)," down ",self.getPowerWallboxDown(current),") powerWallbox=",powerWallbox," W battery ", powerBattery, " W (",self._maxPowerUnloadBatteryDuringCharging," W) ext ",powerBatteryExt," W (",self._maxPowerUnloadBatteryDuringChargingExt," W)")
+
+    newCurrent = current
+
+    if self.getPowerWallboxUp(newCurrent)> power:
+    	self._pvUnderloadCount = 0
+    	self._pvOverloadCount = self._pvOverloadCount + 1
+    elif self.getPowerWallboxDown(newCurrent)< power:
+    	self._pvOverloadCount = 0
+    	if powerWallbox>0:
+    		self._pvUnderloadCount = self._pvUnderloadCount + 1
+    	else:
+    		self._pvUnderloadCount = 0
+    else:
+    	self._pvUnderloadCount = 0
+    	self._pvOverloadCount = 0
+
+    if self._pvOverloadCount>=border:
+    	self._pvOverloadCount = 0		
+    	while newCurrent<maxCurrent and self.getPowerWallboxUp(newCurrent)> power:			
+    		newCurrent = newCurrent+1
+
+    	if debug: 
+    		print("UP ",self.getPowerWallboxUp(newCurrent)," W > ",power," W")
+
+    if self._pvUnderloadCount>=border:
+    	self._pvUnderloadCount = 0	
+    	while newCurrent>6 and self.getPowerWallboxDown(newCurrent)< power:
+    		newCurrent = newCurrent-1
+
+    	if debug: 
+    		print("Down ",self.getPowerWallboxDown(newCurrent)," W < ",power," W")
+
+    if debug: 
+    	print("=> ",current," A -> ",newCurrent," A")
+
+    #if newCurrent!=current:
+    #	self._pvSetLoad(newCurrent, maxCurrent)
+    return newCurrent
+	
+  def _updatePV(self, status, mode, powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent): 
+  	border = 60
+  	debug = False
+	
+  	if debug:
+  		print("_updatePV...Status = ",status," Mode=",mode," External StartStop ",self._dbusservice['/ExternalStartStop']," Current ",self._dbusservice['/ExternalSetCurrent'])
+	
+	# Car is connected
+  	if status==3: #Charging finished
+  		self._pvUnderloadCount = 0
+  		self._pvOverloadCount = 0
+  		#self._pvSetLoad(0, maxCurrent)
+  		if self._dbusservice['/ExternalStartStop']==0:
+  			self._pvSetLoad(0, maxCurrent)
+  		#elif self._dbusservice['/ExternalSetCurrent']==0:					
+  		#	self._pvSetLoad(0, maxCurrent)
+  	elif status!=0:
+  		if mode==0:
+  			print("Manual Mode")
+  		elif mode==1:
+  			newCurrent = self._updatePVsurplusCharging(powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent)
+
+  			'''
+			power = powerGrid - powerWallbox
+
+			if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
+				power = power + (self._maxPowerUnloadBatteryDuringCharging - powerBattery)
+			if powerBatteryExt < -self._maxPowerUnloadBatteryDuringChargingExt:
+				power = power + (self._maxPowerUnloadBatteryDuringChargingExt - powerBatteryExt)
+
+			if debug: 
+				print("Update _pvCount=",self._pvOverloadCount,"-",self._pvUnderloadCount," W power=",power," W (up ",self.getPowerWallboxUp(current)," down ",self.getPowerWallboxDown(current),") powerWallbox=",powerWallbox," W battery ", powerBattery, " W (",self._maxPowerUnloadBatteryDuringCharging," W) ext ",powerBatteryExt," W (",self._maxPowerUnloadBatteryDuringChargingExt," W)")
+
+			newCurrent = current
+
+			if self.getPowerWallboxUp(newCurrent)> power:
+				self._pvUnderloadCount = 0
+				self._pvOverloadCount = self._pvOverloadCount + 1
+			elif self.getPowerWallboxDown(newCurrent)< power:
+				self._pvOverloadCount = 0
+				if powerWallbox>0:
+					self._pvUnderloadCount = self._pvUnderloadCount + 1
+				else:
+					self._pvUnderloadCount = 0
+			else:
+				self._pvUnderloadCount = 0
+				self._pvOverloadCount = 0
+
+			if self._pvOverloadCount>=border:
+				self._pvOverloadCount = 0		
+				while newCurrent<maxCurrent and self.getPowerWallboxUp(newCurrent)> power:			
+					newCurrent = newCurrent+1
+
+				if debug: 
+					print("UP ",self.getPowerWallboxUp(newCurrent)," W > ",power," W")
+
+			if self._pvUnderloadCount>=border:
+				self._pvUnderloadCount = 0	
+				while newCurrent>6 and self.getPowerWallboxDown(newCurrent)< power:
+					newCurrent = newCurrent-1
+
+				if debug: 
+					print("Down ",self.getPowerWallboxDown(newCurrent)," W < ",power," W")
+
+			if debug: 
+				print("=> ",current," A -> ",newCurrent," A")
+  			'''		  
+  			if newCurrent!=current:
+  				if self._dbusservice['/ExternalStartStop']==0:
+  					self._pvSetLoad(newCurrent, maxCurrent)
+  				elif self._dbusservice['/ExternalSetCurrent']==0:					
+  					if newCurrent>0:
+  						self._pvSetLoad(newCurrent, maxCurrent)
+  		elif mode==2:
+  			print("Plan Mode")
+		
+  	else:
+  		self._pvUnderloadCount = 0
+  		self._pvOverloadCount = 0
+  		self._pvSetLoad(0, maxCurrent)
+		
+  	if debug:
+  		print("_updatePV...end")
+			
   def _update(self): 
     
     try:
@@ -366,14 +512,20 @@ class DbusGoeChargerService:
           self._dbusservice['/Current'] = max(data['nrg'][4] * 0.1, data['nrg'][5] * 0.1, data['nrg'][6] * 0.1)
           self._dbusservice['/Ac/Energy/Forward'] = int(float(data['eto']) / 10.0)
           
+          current = int(data['amp'])
+          if current!=self._dbusservice['/SetCurrent']:
+            logging.info("External changed SetCurrent to %s" % (current))   
+            self._dbusservice['/SetCurrent'] = current                
+            self._dbusservice['/ExternalSetCurrent'] = current 
+          maxCurrent = int(data['ama']) 
+          self._dbusservice['/MaxCurrent'] = maxCurrent
           startStop = int(data['alw'])
           if startStop!=self._dbusservice['/StartStop']:
             logging.info("External changed StartStop to %s" % (startStop))            
-            self._dbusservice['/StartStop'] = startStop            
-          current = int(data['amp'])
-          self._dbusservice['/SetCurrent'] = current
-          maxCurrent = int(data['ama']) 
-          self._dbusservice['/MaxCurrent'] = maxCurrent
+            self._dbusservice['/StartStop'] = startStop                    
+            self._dbusservice['/ExternalStartStop'] = startStop
+            if startStop==0:
+            	self._dbusservice['/ExternalSetCurrent'] = 0
           
           # update chargingTime, increment charge time only on active charging (2), reset when no car connected (1)
           timeDelta = time.time() - self._lastUpdate
@@ -407,7 +559,10 @@ class DbusGoeChargerService:
 
           
           #action
-          if status!=0:# and status!=3:
+          self._updatePV(status, mode,  gridPower, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent)
+          
+		
+          if False and status!=0:# and status!=3:
               power = gridPower - powerWallbox
               
               if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
@@ -539,12 +694,12 @@ class DbusGoeChargerService:
                  elif self._pvUnderloadCount>=border:
                     self._pvUnderloadCount = 0;
                     self._pvSetLoad(0, maxCurrent)
-          else:
+          elif False:
             self._pvUnderloadCount = 0
             self._pvOverloadCount = 0
             self._pvSetLoad(0, maxCurrent)
                      
-            
+          
                 
 
           #logging
@@ -573,8 +728,12 @@ class DbusGoeChargerService:
     logging.info("someone else updated %s to %s" % (path, value))
     #print("_handlechangedvalue ",path, "=",value)
     if path == '/SetCurrent':
+      self._dbusservice['/ExternalSetCurrent'] = value 
       return self._setGoeChargerValue('amp', value)
     elif path == '/StartStop':
+      self._dbusservice['/ExternalStartStop'] = value
+      if value==0:
+      	self._dbusservice['/ExternalSetCurrent'] = 0
       return self._setGoeChargerValue('alw', value)
     elif path == '/MaxCurrent':
       return self._setGoeChargerValue('ama', value)
@@ -600,11 +759,15 @@ def main():
                                 logging.StreamHandler()
                             ])
   '''
-  logging.basicConfig(filename=("%s/goeCharger_Vorne.log" % (os.path.dirname(os.path.realpath(__file__)))), 
-                        filemode='w', 
-                        format='%(asctime)s %(levelname)-8s %(message)s',
+	#filename=("%s/goeCharger_Vorne.log" % (os.path.dirname(os.path.realpath(__file__)))), 
+  logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S', 
-                        level=logging.INFO)
+					    #filemode='w',                        
+                        level=logging.INFO,
+                            handlers=[
+                                logging.FileHandler("%s/goeCharger_Vorne.log" % (os.path.dirname(os.path.realpath(__file__)))),
+                                logging.StreamHandler()
+                            ])
   try:
       logging.info("Start")
   
@@ -635,9 +798,11 @@ def main():
           '/Ac/Voltage': {'initial': 0, 'textformat': _v},
           '/Current': {'initial': 0, 'textformat': _a},
           '/SetCurrent': {'initial': 0, 'textformat': _a},
+          '/ExternalSetCurrent': {'initial': 0, 'textformat': _a},
           '/MaxCurrent': {'initial': 0, 'textformat': _a},
           '/MCU/Temperature': {'initial': 0, 'textformat': _degC},
           '/StartStop': {'initial': 0, 'textformat': _n},
+          '/ExternalStartStop': {'initial': 0, 'textformat': _n},			
           '/Mode':  {'initial': 0, 'textformat': _n},
           '/Status':  {'initial': 0, 'textformat': _n},
         }
