@@ -25,6 +25,9 @@ from vedbus import VeDbusService
 class DbusGoeChargerService:
   def __init__(self, servicename, paths, productname='go-eCharger', connection='go-eCharger HTTP JSON service'):
     config = self._getConfig()
+    
+    self._getLoggingLevel(config)
+    
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
     hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
     guiname = config['DEFAULT']['Name'];
@@ -93,18 +96,31 @@ class DbusGoeChargerService:
     self._maxPowerUnloadBatteryDuringCharging = 0
     self._maxPowerUnloadBatteryDuringChargingExt = 0
     
+    #
+    self._powerWallboxAvg = 0
+    self._powerOverloadAvg = 0
+    self._powerUnderloadAvg = 0
+    
     self._pvOverloadCount = 0
     self._pvUnderloadCount = 0
+    self._pvCurrentCount = 0;
     self._lastNumberOfPhases = 3
+    self._waitForDisconnect = False
+    
+    self._powerBatteryAvg = 0
+    self._powerBatteryExtAvg = 0
     
     self._batteryReduceloadCount = 0
     self._batteryIncreaseloadCount = 0
+    self._batteryCount = 0
     
     # last update
     self._lastUpdate = 0
     
     # charging time in float
     self._chargingTime = 0.0
+    
+    self._statusMessage = ""
 
     # add _update function 'timer'
     gobject.timeout_add(1000, self._update) # pause 250ms before the next request
@@ -117,7 +133,17 @@ class DbusGoeChargerService:
     config.read("%s/config.ini" % (os.path.dirname(os.path.realpath(__file__))))
     return config
  
- 
+  def _getLoggingLevel(self, config):
+    print(config['DEFAULT']['LOG_level'])
+    log_level_info = {'logging.DEBUG': logging.DEBUG, 
+                        'logging.INFO': logging.INFO,
+                        'logging.WARNING': logging.WARNING,
+                        'logging.ERROR': logging.ERROR,
+                        }
+    my_log_level_from_config = config['DEFAULT']['Log_Level']
+    my_log_level = log_level_info.get(my_log_level_from_config, logging.ERROR)
+    logging.getLogger().setLevel(my_log_level)
+    
   def _getSignOfLifeInterval(self):
     config = self._getConfig()
     value = config['DEFAULT']['SignOfLifeLog']
@@ -199,6 +225,7 @@ class DbusGoeChargerService:
     logging.info("Last '/Ac/Power': %s" % (self._dbusservice['/Ac/Power']))
     logging.info("Last '/Mode': %s" % (self._dbusservice['/Mode']))
     logging.info("Last '/SetCurrent': %s" % (self._dbusservice['/SetCurrent']))
+    logging.info("Last 'statusMessage': %s" % (self._statusMessage))
     logging.info("--- End: sign of life ---")
     return True
   
@@ -222,6 +249,7 @@ class DbusGoeChargerService:
         return 1
         
   def reset(self):
+     logging.info("BATT::Reset maxCharge= %s W",self._powerBatteryMaxCharge_reset)
      self._powerBatteryMaxCharge.SetValue(self._powerBatteryMaxCharge_reset)
   
   def _batterySetLoad(self, power, maxPower):
@@ -283,8 +311,8 @@ class DbusGoeChargerService:
     return -1.0*(self.getPowerWallbox(current)-200)
 
   def _updatePVsurplusCharging(self, powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent):
-    border = 60
-    debug = False
+    border = 30
+    debug = True
     power = powerGrid - powerWallbox
 		
     if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
@@ -292,27 +320,44 @@ class DbusGoeChargerService:
     if powerBatteryExt < -self._maxPowerUnloadBatteryDuringChargingExt:
     	power = power + (self._maxPowerUnloadBatteryDuringChargingExt - powerBatteryExt)
 
-    if debug: 
-    	print("Update _pvCount=",self._pvOverloadCount,"-",self._pvUnderloadCount," W power=",power," W (up ",self.getPowerWallboxUp(current)," down ",self.getPowerWallboxDown(current),") powerWallbox=",powerWallbox," W battery ", powerBattery, " W (",self._maxPowerUnloadBatteryDuringCharging," W) ext ",powerBatteryExt," W (",self._maxPowerUnloadBatteryDuringChargingExt," W)")
+    logging.debug("WALLBOX::updatePVsurplus _pvCount= %s - %s power = %s W (up %s W, down %s W) wallbox = %s W battery = %s W (%s W) batteryExt = %s W (%s W)",self._pvOverloadCount,self._pvUnderloadCount,power,self.getPowerWallboxUp(current),self.getPowerWallboxDown(current),powerWallbox, powerBattery,self._maxPowerUnloadBatteryDuringCharging,powerBatteryExt,self._maxPowerUnloadBatteryDuringChargingExt)
 
+    logging.debug("WALLBOX::updatePVsurplus _curreentCount = %s wallboxAvg = %s W",self._pvCurrentCount,self._powerWallboxAvg)
+    
+    if self._pvCurrentCount>=border:
+        self._pvCurrentCount = 0;
+        if self._powerWallboxAvg==0:
+            current = 6;
+        elif self._powerWallboxAvg<500 and current>0:
+            #Stop Load and wait for disconnect
+            self._waitForDisconnect = True
+            return 0
+    else:
+        self._powerWallboxAvg = (self._powerWallboxAvg * self._pvCurrentCount +powerWallbox)/(self._pvCurrentCount +1)
+        self._pvCurrentCount = self._pvCurrentCount +1
+        
     newCurrent = current
+    
 
     if self.getPowerWallboxUp(newCurrent)> power:
+    	self._powerOverloadAvg = (self._powerOverloadAvg*self._pvOverloadCount + power)/(self._pvOverloadCount + 1);
     	self._pvUnderloadCount = 0
     	self._pvOverloadCount = self._pvOverloadCount + 1
     elif self.getPowerWallboxDown(newCurrent)< power:
-    	self._pvOverloadCount = 0
-    	if powerWallbox>0:
-    		self._pvUnderloadCount = self._pvUnderloadCount + 1
-    	else:
-    		self._pvUnderloadCount = 0
+        self._powerUnderloadAvg = (self._powerUnderloadAvg*self._pvUnderloadCount + power)/(self._pvUnderloadCount + 1);
+        self._pvOverloadCount = 0
+        if powerWallbox>0:
+            self._pvUnderloadCount = self._pvUnderloadCount + 1
+        else:
+            self._pvUnderloadCount = 0
     else:
     	self._pvUnderloadCount = 0
     	self._pvOverloadCount = 0
 
+        
     if self._pvOverloadCount>=border:
     	self._pvOverloadCount = 0		
-    	while newCurrent<maxCurrent and self.getPowerWallboxUp(newCurrent)> power:			
+    	while newCurrent<maxCurrent and self.getPowerWallboxUp(newCurrent)> self._powerOverloadAvg:			
     		newCurrent = newCurrent+1
 
     	if debug: 
@@ -320,7 +365,7 @@ class DbusGoeChargerService:
 
     if self._pvUnderloadCount>=border:
     	self._pvUnderloadCount = 0	
-    	while newCurrent>6 and self.getPowerWallboxDown(newCurrent)< power:
+    	while newCurrent>6 and self.getPowerWallboxDown(newCurrent)< self._powerUnderloadAvg:
     		newCurrent = newCurrent-1
 
     	if debug: 
@@ -332,16 +377,48 @@ class DbusGoeChargerService:
     #if newCurrent!=current:
     #	self._pvSetLoad(newCurrent, maxCurrent)
     return newCurrent
-	
+
+  def _updateBattery(self, powerBattery, powerBatteryExt, powerBatteryMaxCharge):
+    border = 15
+    borderZeroBattery = 100
+    #debug = False
+    
+    logging.debug("BATT::Update _batterCount= %s BatteryAvg = %s W BatteryExtAvg = %s W Battery = %s W BatteryExt = %s W",self._batteryCount,int(self._powerBatteryAvg),int(self._powerBatteryExtAvg), int(powerBattery),int(powerBatteryExt));
+       
+    
+    if self._batteryCount>=border:
+        self._batteryCount = 0;
+        if self._powerBatteryAvg > borderZeroBattery and self._powerBatteryExtAvg<self._maxPowerUnloadBatteryExt:
+            #Reduce Load
+            value = round((self._powerBatteryAvg + (self._powerBatteryExtAvg))/100+0.5,0)*100
+            logging.info("BATT::[batteryAvg=%s W batteryExtAvg=%s W]\tReduce max. charge rate to %s W",int(self._powerBatteryAvg), int(self._powerBatteryExtAvg),(value))
+            self._batterySetLoad(value, powerBatteryMaxCharge)
+        elif self._powerBatteryExtAvg>=0 and powerBatteryMaxCharge<self._powerBatteryMaxCharge_reset:
+            #Reset Load when Ext Battery Charging
+            #if powerBatteryExt > 1000:
+            logging.info("BATT::[batteryAvg=%s W batteryExtAvg=%s W]\tIncrease max. charge rate to max by %s W",int(self._powerBatteryAvg), int(self._powerBatteryExtAvg),(self._powerBatteryMaxCharge_reset))
+            self._batterySetLoad(self._powerBatteryMaxCharge_reset, powerBatteryMaxCharge)
+            #else
+            #value = powerBattery-(gridPower+100)
+            #value = int(math.ceil(value / 100.0)) * 100
+            #logging.info("Increase max. charge rate to %s W" % (value))
+            #self._batterySetLoad(value, powerBatteryMaxCharge)
+        else:
+            logging.info("BATT::[batteryAvg=%s W batteryExtAvg=%s W]\tNo Action",int(self._powerBatteryAvg), int(self._powerBatteryExtAvg))
+    else:
+        self._powerBatteryAvg = (self._powerBatteryAvg * self._batteryCount +powerBattery)/(self._batteryCount +1)
+        self._powerBatteryExtAvg = (self._powerBatteryExtAvg * self._batteryCount +powerBatteryExt)/(self._batteryCount +1)
+        self._batteryCount = self._batteryCount +1
+
   def _updatePV(self, status, mode, powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent): 
   	border = 60
-  	debug = False
-	
-  	if debug:
-  		print("_updatePV...Status = ",status," Mode=",mode," External StartStop ",self._dbusservice['/ExternalStartStop']," Current ",self._dbusservice['/ExternalSetCurrent'])
+  	
+  	logging.debug("WALLBOX::Update Status = %s Mode = %s External-StartStop = %s Current = %s A",status,mode,self._dbusservice['/ExternalStartStop'],self._dbusservice['/ExternalSetCurrent'])
 	
 	# Car is connected
-  	if status==3: #Charging finished
+  	if status==3 and self._dbusservice['/ExternalStartStop']==0: #Charging finished
+  		self._statusMessage = "[Status=3] Charging finished";
+    
   		self._pvUnderloadCount = 0
   		self._pvOverloadCount = 0
   		#self._pvSetLoad(0, maxCurrent)
@@ -351,10 +428,13 @@ class DbusGoeChargerService:
   		#	self._pvSetLoad(0, maxCurrent)
   	elif status!=0:
   		if mode==0:
-  			print("Manual Mode")
+  			self._statusMessage = "[Status = "+str(status)+"] Mode=0";
+  			logging.debug("WALLBOX::Manual Mode")
   		elif mode==1:
+  			logging.debug("WALLBOX::Auto Mode")
+  			self._statusMessage = "[Status = "+str(status)+"] Mode=1";
   			newCurrent = self._updatePVsurplusCharging(powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent)
-
+               
   			'''
 			power = powerGrid - powerWallbox
 
@@ -401,21 +481,29 @@ class DbusGoeChargerService:
 				print("=> ",current," A -> ",newCurrent," A")
   			'''		  
   			if newCurrent!=current:
+  				#print("Set New Current")
   				if self._dbusservice['/ExternalStartStop']==0:
+  					#print("AB")
   					self._pvSetLoad(newCurrent, maxCurrent)
-  				elif self._dbusservice['/ExternalSetCurrent']==0:					
+  				elif self._dbusservice['/ExternalSetCurrent']==0:	
+  					#print("ABC")
   					if newCurrent>0:
+  						#print("ABCD")
   						self._pvSetLoad(newCurrent, maxCurrent)
+  				#else:
+  					#print("ABEE ",self._dbusservice['/ExternalStartStop']," and ",self._dbusservice['/ExternalSetCurrent'])
   		elif mode==2:
-  			print("Plan Mode")
+  			self._statusMessage = "[Status = "+str(status)+"] Mode=2";
+  			logging.debug("WALLBOX::Plan Mode")
 		
   	else:
+  		self._statusMessage = "[Status=0] No Car";
+        
   		self._pvUnderloadCount = 0
   		self._pvOverloadCount = 0
   		self._pvSetLoad(0, maxCurrent)
 		
-  	if debug:
-  		print("_updatePV...end")
+  	logging.debug("WALLBOX::Update ... end")
 			
   def _update(self): 
     
@@ -429,47 +517,16 @@ class DbusGoeChargerService:
        powerBattery = self._powerBattery.GetValue()
        powerBatteryExt = self._powerBatteryExt.GetValue()
        powerBatteryMaxCharge = self._powerBatteryMaxCharge.GetValue()
-       borderZeroBattery = 100
-       batteryCounter = 15
+       
        
        #Check if maxCharge is changed external
        if powerBatteryMaxCharge!=self._powerBatteryMaxCharge_reset and powerBatteryMaxCharge!=self._powerBatteryMaxCharge_last:
           self._powerBatteryMaxCharge_reset = powerBatteryMaxCharge
           logging.info("Set max. charge value by reset to %s W" % (powerBatteryMaxCharge))
        
-       if powerBattery > borderZeroBattery and powerBatteryExt<self._maxPowerUnloadBatteryExt:
-          self._batteryReduceloadCount = self._batteryReduceloadCount + 1
-          self._batteryIncreaseloadCount = 0
-       elif powerBatteryExt >= 0 and powerBatteryMaxCharge<self._powerBatteryMaxCharge_reset:
-          self._batteryIncreaseloadCount = self._batteryIncreaseloadCount + 1
-          self._batteryReduceloadCount = 0
-       else:
-          self._batteryReduceloadCount = 0
-          self._batteryIncreaseloadCount = 0
-       
-       if debug and debugBattery: 
-          print("Update _batterCount=",self._batteryReduceloadCount,"-",self._batteryIncreaseloadCount," maxCharge= ",powerBatteryMaxCharge," reset= ",self._powerBatteryMaxCharge_reset);
-       
-       if self._batteryReduceloadCount>=batteryCounter:
-          self._batteryReduceloadCount = 0
-          value = round((powerBattery + (powerBatteryExt))/100+0.5,0)*100
-          if debug:
-            print("_batterySetLoad ",powerBattery," + ",(powerBatteryExt - 100)," = ",(powerBattery + (powerBatteryExt - 100)),"->",value)
-          logging.info("Reduce max. charge rate to %s W" % (value))
-          self._batterySetLoad(value, powerBatteryMaxCharge)
-          
-       if self._batteryIncreaseloadCount>=batteryCounter:
-          self._batteryIncreaseloadCount = 0
-          if powerBatteryExt > 1000:
-            logging.info("Increase max. charge rate to max by %s W" % (self._powerBatteryMaxCharge_reset))
-            self._batterySetLoad(self._powerBatteryMaxCharge_reset, powerBatteryMaxCharge)
-          else:
-            value = powerBattery-(gridPower+100)
-            value = int(math.ceil(value / 100.0)) * 100
-            logging.info("Increase max. charge rate to %s W" % (value))
-            self._batterySetLoad(value, powerBatteryMaxCharge)
-          #print("powerBattery=",powerBattery," gridPower=",gridPower)
-          #self._batterySetLoad(powerBattery - (gridPower + 100), powerBatteryMaxCharge)
+       #Action
+       self._updateBattery(powerBattery, powerBatteryExt, powerBatteryMaxCharge)
+		  
        
        if data is not None:
           #send data to DBus
@@ -514,18 +571,22 @@ class DbusGoeChargerService:
           
           current = int(data['amp'])
           if current!=self._dbusservice['/SetCurrent']:
-            logging.info("External changed SetCurrent to %s" % (current))   
             self._dbusservice['/SetCurrent'] = current                
-            self._dbusservice['/ExternalSetCurrent'] = current 
+            if self._lastUpdate>0:
+                logging.info("External changed SetCurrent to %s [goe-App/Wallbox]" % (current))   
+                self._dbusservice['/ExternalSetCurrent'] = current 
+                
           maxCurrent = int(data['ama']) 
           self._dbusservice['/MaxCurrent'] = maxCurrent
+          
           startStop = int(data['alw'])
           if startStop!=self._dbusservice['/StartStop']:
-            logging.info("External changed StartStop to %s" % (startStop))            
-            self._dbusservice['/StartStop'] = startStop                    
-            self._dbusservice['/ExternalStartStop'] = startStop
-            if startStop==0:
-            	self._dbusservice['/ExternalSetCurrent'] = 0
+            self._dbusservice['/StartStop'] = startStop
+            if self._lastUpdate>0:       
+                logging.info("External changed StartStop to %s [goe-App/Wallbox]" % (startStop))            
+                self._dbusservice['/ExternalStartStop'] = startStop
+                if startStop==0:
+                    self._dbusservice['/ExternalSetCurrent'] = 0
           
           # update chargingTime, increment charge time only on active charging (2), reset when no car connected (1)
           timeDelta = time.time() - self._lastUpdate
@@ -560,145 +621,7 @@ class DbusGoeChargerService:
           
           #action
           self._updatePV(status, mode,  gridPower, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent)
-          
-		
-          if False and status!=0:# and status!=3:
-              power = gridPower - powerWallbox
-              
-              if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
-                power = power + (self._maxPowerUnloadBatteryDuringCharging - powerBattery)
-              if powerBatteryExt < -self._maxPowerUnloadBatteryDuringChargingExt:
-                power = power + (self._maxPowerUnloadBatteryDuringChargingExt - powerBatteryExt)
-              
-              border = 60
-              reserve = 200
-              reserveUp = 200
-              reserveDown = 200
-              lastPowerPointUp = -((2800)/2*self._lastNumberOfPhases+reserveUp)
-              lastPowerPointDown = -((2800)/2*self._lastNumberOfPhases-reserveDown)
-              
-              if debug: 
-                 print("Update _pvCount=",self._pvOverloadCount,"-",self._pvUnderloadCount," ?= ",lastPowerPointUp,"...",lastPowerPointDown," W power=",power," W powerWallbox=",powerWallbox," W byttery ", powerBattery, " W ext ",powerBatteryExt," W")
-              
-              
-              if power<lastPowerPointUp:
-                self._pvUnderloadCount = 0
-                self._pvOverloadCount = self._pvOverloadCount + 1
-              elif power<lastPowerPointDown:
-                self._pvUnderloadCount = 0
-                self._pvOverloadCount = 0
-              else:
-                self._pvOverloadCount = 0
-                if powerWallbox>0:
-                    self._pvUnderloadCount = self._pvUnderloadCount + 1
-                else:
-                    self._pvUnderloadCount = 0
-              
-              if mode==1:
-                 if self._pvOverloadCount>=border:
-                     self._pvOverloadCount = 0
-                     #print(power,"<-(",7400/2,"*",self._lastNumberOfPhases,"+",reserve,")=",-((7400)/2*self._lastNumberOfPhases+reserve))
-                     
-                     if powerBattery>500:
-                        amount = powerBattery - 500
-                        reserve = reserve - amount
-                        reserveDown = reserveDown - amount
-                        print("Reserve = ",reserve," ReserveDown = ",reserveDown)
-                     
-                     if power<-((7400)/2*self._lastNumberOfPhases+reserve):                        
-                        self._pvSetLoad(16, maxCurrent)
-                     elif power<-((6900)/2*self._lastNumberOfPhases+reserve):
-                        if current>15:
-                            if power<-((7400)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(15, maxCurrent)
-                            else:
-                                self._pvSetLoad(16, maxCurrent)
-                        else:
-                            self._pvSetLoad(15, maxCurrent)
-                     elif power<-((6400)/2*self._lastNumberOfPhases+reserve):
-                        if current>14:
-                            if power<-((6900)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(14, maxCurrent)
-                            else:
-                                self._pvSetLoad(15, maxCurrent)
-                        else:
-                            self._pvSetLoad(14, maxCurrent)
-                     elif power<-((6000)/2*self._lastNumberOfPhases+reserve):
-                        if current>13:
-                            if power<-((6400)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(13, maxCurrent)
-                            else:
-                                self._pvSetLoad(14, maxCurrent)
-                        else:
-                            self._pvSetLoad(13, maxCurrent)
-                     elif power<-((5500)/2*self._lastNumberOfPhases+reserve):
-                        if current>12:
-                            if power<-((6000)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(12, maxCurrent)
-                            else:
-                                self._pvSetLoad(13, maxCurrent)
-                        else:
-                            self._pvSetLoad(12, maxCurrent)
-                     elif power<-((5100)/2*self._lastNumberOfPhases+reserve):
-                        if current>11:
-                            if power<-((5500)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(11, maxCurrent)
-                            else:
-                                self._pvSetLoad(12, maxCurrent)
-                        else:
-                            self._pvSetLoad(11, maxCurrent)
-                     elif power<-((4600)/2*self._lastNumberOfPhases+reserve):
-                        if current>10:
-                            if power<-((5100)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(10, maxCurrent)
-                            else:
-                                self._pvSetLoad(11, maxCurrent)
-                        else:
-                            self._pvSetLoad(10, maxCurrent)
-                     elif power<-((4100)/2*self._lastNumberOfPhases+reserve):
-                        if debug:
-                            print("[",current," A] Amout to 10 A -> ",power," < ", -((4600)/2*self._lastNumberOfPhases+reserve)," or ",-((4600)/2*self._lastNumberOfPhases-reserveDown))
-                        if current>9:
-                            if power<-((4600)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(9, maxCurrent)
-                            else:
-                                self._pvSetLoad(10, maxCurrent)
-                        else:
-                            self._pvSetLoad(9, maxCurrent)
-                     elif power<-((3700)/2*self._lastNumberOfPhases+reserve):
-                        if debug:
-                            print("[",current," A] Amout to 9 A -> ",power," < ", -((4100)/2*self._lastNumberOfPhases+reserve)," or ",-((4100)/2*self._lastNumberOfPhases-reserveDown))
-                        if current>8:
-                            if power<-((4100)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(8, maxCurrent)
-                            else:
-                                self._pvSetLoad(9, maxCurrent)
-                        else:
-                            self._pvSetLoad(8, maxCurrent)
-                     elif power<-((3200)/2*self._lastNumberOfPhases+reserve):
-                        if current>7:
-                            if power<-((3700)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(7, maxCurrent)
-                            else:
-                                self._pvSetLoad(8, maxCurrent)
-                        else:
-                            self._pvSetLoad(7, maxCurrent)
-                     elif power<lastPowerPointUp:
-                        if current>6:
-                            if power<-((3200)/2*self._lastNumberOfPhases-reserveDown):
-                                self._pvSetLoad(6, maxCurrent)
-                            else:
-                                self._pvSetLoad(7, maxCurrent)
-                        else:
-                            self._pvSetLoad(6, maxCurrent)
-                 elif self._pvUnderloadCount>=border:
-                    self._pvUnderloadCount = 0;
-                    self._pvSetLoad(0, maxCurrent)
-          elif False:
-            self._pvUnderloadCount = 0
-            self._pvOverloadCount = 0
-            self._pvSetLoad(0, maxCurrent)
-                     
+                  
           
                 
 
@@ -725,12 +648,14 @@ class DbusGoeChargerService:
     return True
  
   def _handlechangedvalue(self, path, value):
-    logging.info("someone else updated %s to %s" % (path, value))
+    #logging.info("someone else updated %s to %s" % (path, value))
     #print("_handlechangedvalue ",path, "=",value)
     if path == '/SetCurrent':
+      logging.info("External changed SetCurrent to %s [VRM]" % (value))
       self._dbusservice['/ExternalSetCurrent'] = value 
       return self._setGoeChargerValue('amp', value)
     elif path == '/StartStop':
+      logging.info("External changed StartStop to %s [VRM]" % (value))
       self._dbusservice['/ExternalStartStop'] = value
       if value==0:
       	self._dbusservice['/ExternalSetCurrent'] = 0
@@ -738,6 +663,7 @@ class DbusGoeChargerService:
     elif path == '/MaxCurrent':
       return self._setGoeChargerValue('ama', value)
     elif path == '/Mode':
+      logging.info("External changed Mode to %s [VRM]" % (value))
       return self._setGoeChargerValue('ast', self._evCharger2GoeMode(value))    
     else:
       logging.info("mapping for evcharger path %s does not exist" % (path))
