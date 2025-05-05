@@ -97,6 +97,7 @@ class DbusGoeChargerService:
     self._maxPowerUnloadBatteryDuringChargingExt = 0
     
     #
+    self._enableRestart = False
     self._powerWallboxAvg = 0
     self._powerOverloadAvg = 0
     self._powerUnderloadAvg = 0
@@ -264,13 +265,15 @@ class DbusGoeChargerService:
         self._powerBatteryMaxCharge_last = power
         self._powerBatteryMaxCharge.SetValue(power)
         
-  def _pvSetLoad(self, current, currentMax):
+  def _pvSetLoad(self, current, currentMax, enableRestart = False):
     #print("_pvSetLoad(",current," A, ",currentMax," A)")
     if current==0:
        if self._dbusservice['/StartStop']==1:
           logging.info("Wallbox::Stop Loading")   
           self._dbusservice['/StartStop'] = 0
           self._setGoeChargerValue('alw', 0)
+          if enableRestart:
+             self._enableRestart = True
        if currentMax>0 and self._dbusservice['/SetCurrent']!=currentMax:
           logging.info("Wallbox::Reset current to %s A" % (currentMax))
           self._dbusservice['/SetCurrent'] = currentMax   
@@ -287,6 +290,8 @@ class DbusGoeChargerService:
           logging.info("Wallbox::Start Loading") 
           self._dbusservice['/StartStop'] = 1  
           self._setGoeChargerValue('alw', 1)
+          if enableRestart:
+             self._enableRestart = False
   
   def _getNumberOfPhases(self, powerL1, powerL2, powerL3):
         count = 0;
@@ -322,7 +327,7 @@ class DbusGoeChargerService:
 
     logging.debug("WALLBOX::updatePVsurplus _pvCount= %s - %s power = %s W (up %s W, down %s W) wallbox = %s W battery = %s W (%s W) batteryExt = %s W (%s W)",self._pvOverloadCount,self._pvUnderloadCount,power,self.getPowerWallboxUp(current),self.getPowerWallboxDown(current),powerWallbox, powerBattery,self._maxPowerUnloadBatteryDuringCharging,powerBatteryExt,self._maxPowerUnloadBatteryDuringChargingExt)
 
-    logging.debug("WALLBOX::updatePVsurplus _curreentCount = %s wallboxAvg = %s W",self._pvCurrentCount,self._powerWallboxAvg)
+    logging.debug("WALLBOX::updatePVsurplus _currentCount = %s wallboxAvg = %s W",self._pvCurrentCount,self._powerWallboxAvg)
     
     if self._pvCurrentCount>=border:
         self._pvCurrentCount = 0;
@@ -346,7 +351,7 @@ class DbusGoeChargerService:
     elif self.getPowerWallboxDown(newCurrent)< power:
         self._powerUnderloadAvg = (self._powerUnderloadAvg*self._pvUnderloadCount + power)/(self._pvUnderloadCount + 1);
         self._pvOverloadCount = 0
-        if powerWallbox>0:
+        if self._powerWallboxAvg>0:
             self._pvUnderloadCount = self._pvUnderloadCount + 1
         else:
             self._pvUnderloadCount = 0
@@ -361,18 +366,22 @@ class DbusGoeChargerService:
     		newCurrent = newCurrent+1
 
     	if debug: 
-    		print("UP ",self.getPowerWallboxUp(newCurrent)," W > ",power," W")
+    		logging.info("UP to %s A => %s W > %s W",current, self.getPowerWallboxUp(newCurrent),power)
 
     if self._pvUnderloadCount>=border:
+    	logging.info("UnderloadCoun Reach Border -> newCurrent = %s A powerUnderload = %s W",newCurrent,self._powerUnderloadAvg);
     	self._pvUnderloadCount = 0	
-    	while newCurrent>6 and self.getPowerWallboxDown(newCurrent)< self._powerUnderloadAvg:
+    	while newCurrent>0 and self.getPowerWallboxDown(newCurrent)< self._powerUnderloadAvg:
     		newCurrent = newCurrent-1
 
+    	if newCurrent<6:
+           newCurrent = 0
+
     	if debug: 
-    		print("Down ",self.getPowerWallboxDown(newCurrent)," W < ",power," W")
+    		logging.info("Down to %s A => %s W < %s W",current,self.getPowerWallboxDown(newCurrent),power)
 
     if debug: 
-    	print("=> ",current," A -> ",newCurrent," A")
+    	print("=> ",current," A -> ",newCurrent," A underloadCount =",self._pvUnderloadCount)
 
     #if newCurrent!=current:
     #	self._pvSetLoad(newCurrent, maxCurrent)
@@ -422,11 +431,11 @@ class DbusGoeChargerService:
   		self._pvUnderloadCount = 0
   		self._pvOverloadCount = 0
   		#self._pvSetLoad(0, maxCurrent)
-  		if self._dbusservice['/ExternalStartStop']==0:
+  		if self._dbusservice['/ExternalStartStop']==0: #Externes Laden: Deaktiviert -> Reset Current to 16A 
   			self._pvSetLoad(0, maxCurrent)
   		#elif self._dbusservice['/ExternalSetCurrent']==0:					
   		#	self._pvSetLoad(0, maxCurrent)
-  	elif status!=0:
+  	elif status!=0 or (status==3 and _enableRestart==True):
   		if mode==0:
   			self._statusMessage = "[Status = "+str(status)+"] Mode=0";
   			logging.debug("WALLBOX::Manual Mode")
@@ -482,10 +491,13 @@ class DbusGoeChargerService:
   			'''		  
   			if newCurrent!=current:
   				#print("Set New Current")
-  				if self._dbusservice['/ExternalStartStop']==0:
-  					#print("AB")
-  					self._pvSetLoad(newCurrent, maxCurrent)
-  				elif self._dbusservice['/ExternalSetCurrent']==0:	
+  				if self._dbusservice['/ExternalStartStop']==0: # Externes Laden: Deaktiviert -> Set newCurrent 
+  					if newCurrent>0:
+  					   logging.info("Activate Loadind");
+  					elif newCurrent==0:
+  					   logging.info("Deactivate Loading")
+  					self._pvSetLoad(newCurrent, maxCurrent, True)
+  				elif self._dbusservice['/ExternalSetCurrent']==0:	 # Externes LAden: Aktiviert -> Set cureent ohne Ausschalten
   					#print("ABC")
   					if newCurrent>0:
   						#print("ABCD")
