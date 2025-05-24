@@ -93,19 +93,27 @@ class DbusGoeChargerService:
     self._maxPowerUnloadBatteryExt = 0
     
     #Invert Internal/External Battery during Loading Car
+    self._minPowerLoadBatteryDuringCharging = 500
+    self._minPowerLoadBatteryDuringChargingExt = 500
     self._maxPowerUnloadBatteryDuringCharging = 0
     self._maxPowerUnloadBatteryDuringChargingExt = 0
     
     #
-    self._enableRestart = False
+    self._enableRestart = True
+    self._finishLoadCounter = 0
+    self._restartCounter = 0
+    self._restartCounterLimit = 60*60*6
+    
     self._powerWallboxAvg = 0
     self._powerOverloadAvg = 0
     self._powerUnderloadAvg = 0
     
+    self._lastStatus = 0
     self._pvOverloadCount = 0
     self._pvUnderloadCount = 0
     self._pvCurrentCount = 0;
     self._lastNumberOfPhases = 3
+    self._lastCurrentAvg = 0
     self._waitForDisconnect = False
     
     self._powerBatteryAvg = 0
@@ -226,6 +234,7 @@ class DbusGoeChargerService:
     logging.info("Last '/Ac/Power': %s" % (self._dbusservice['/Ac/Power']))
     logging.info("Last '/Mode': %s" % (self._dbusservice['/Mode']))
     logging.info("Last '/SetCurrent': %s" % (self._dbusservice['/SetCurrent']))
+    logging.info("Last 'lastCurrentAvg': %s" % (self._lastCurrentAvg))
     logging.info("Last 'statusMessage': %s" % (self._statusMessage))
     logging.info("--- End: sign of life ---")
     return True
@@ -273,7 +282,11 @@ class DbusGoeChargerService:
           self._dbusservice['/StartStop'] = 0
           self._setGoeChargerValue('alw', 0)
           if enableRestart:
+             logging.info("Wallbox::Enable Restart")  
              self._enableRestart = True
+       else:
+          logging.info("Wallbox::Already Stopped")
+          
        if currentMax>0 and self._dbusservice['/SetCurrent']!=currentMax:
           logging.info("Wallbox::Reset current to %s A" % (currentMax))
           self._dbusservice['/SetCurrent'] = currentMax   
@@ -288,9 +301,10 @@ class DbusGoeChargerService:
           self._setGoeChargerValue('amp', current)
        if self._dbusservice['/StartStop']==0:
           logging.info("Wallbox::Start Loading") 
+          self._finishLoadCounter = 30
           self._dbusservice['/StartStop'] = 1  
           self._setGoeChargerValue('alw', 1)
-          if enableRestart:
+          if enableRestart: # -> change with status
              self._enableRestart = False
   
   def _getNumberOfPhases(self, powerL1, powerL2, powerL3):
@@ -302,6 +316,10 @@ class DbusGoeChargerService:
             count = count+1
         if powerL3>0: 
             count = count+1
+        # BUG
+        if count==3:
+            factor = powerL3/((powerL1 + powerL2)/2.0);
+            count = 2 + factor;
         
         return count
 	
@@ -315,10 +333,11 @@ class DbusGoeChargerService:
   def getPowerWallboxDown(self, current): 
     return -1.0*(self.getPowerWallbox(current)-200)
 
-  def _updatePVsurplusCharging(self, powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent):
+  def _updatePVsurplusCharging(self, powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent, msg):
+    #print("_updatePVsurplusCharging")
     border = 30
     debug = True
-    power = powerGrid - powerWallbox
+    power = powerGrid - powerWallbox - (0,powerBattery - self._minPowerLoadBatteryDuringCharging)[powerBattery>0] - (0, powerBatteryExt - self._minPowerLoadBatteryDuringChargingExt)[powerBatteryExt>0]
 		
     if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
     	power = power + (self._maxPowerUnloadBatteryDuringCharging - powerBattery)
@@ -329,25 +348,28 @@ class DbusGoeChargerService:
 
     logging.debug("WALLBOX::updatePVsurplus _currentCount = %s wallboxAvg = %s W",self._pvCurrentCount,self._powerWallboxAvg)
     
+    #newCurrent = current
+    
     if self._pvCurrentCount>=border:
         self._pvCurrentCount = 0;
-        if self._powerWallboxAvg==0:
-            current = 6;
-        elif self._powerWallboxAvg<500 and current>0:
+        #if self._powerWallboxAvg==0:
+        #    current = 6;
+        #if self._powerWallboxAvg>0 and self._powerWallboxAvg<500 and current>0:
             #Stop Load and wait for disconnect
-            self._waitForDisconnect = True
-            return 0
+        #    self._waitForDisconnect = True
+        #    return 0
     else:
         self._powerWallboxAvg = (self._powerWallboxAvg * self._pvCurrentCount +powerWallbox)/(self._pvCurrentCount +1)
         self._pvCurrentCount = self._pvCurrentCount +1
         
     newCurrent = current
     
-
+    msg = "power ="+str(power)+" powerUp="+str(self.getPowerWallboxUp(newCurrent))+" powerWallbox="+str(powerWallbox)+" avg="+str(self._powerWallboxAvg)
     if self.getPowerWallboxUp(newCurrent)> power:
     	self._powerOverloadAvg = (self._powerOverloadAvg*self._pvOverloadCount + power)/(self._pvOverloadCount + 1);
     	self._pvUnderloadCount = 0
     	self._pvOverloadCount = self._pvOverloadCount + 1
+    # elif self.getPowerWallboxDown(self._lastCurrentAvg)< power:
     elif self.getPowerWallboxDown(newCurrent)< power:
         self._powerUnderloadAvg = (self._powerUnderloadAvg*self._pvUnderloadCount + power)/(self._pvUnderloadCount + 1);
         self._pvOverloadCount = 0
@@ -378,13 +400,14 @@ class DbusGoeChargerService:
            newCurrent = 0
 
     	if debug: 
-    		logging.info("Down to %s A => %s W < %s W",current,self.getPowerWallboxDown(newCurrent),power)
+    		logging.info("Down to %s A => %s W < %s W",newCurrent,self.getPowerWallboxDown(current),power)
 
     if debug: 
-    	print("=> ",current," A -> ",newCurrent," A underloadCount =",self._pvUnderloadCount)
+    	print("=> ",current," A -> ",newCurrent," A underloadCount =",self._pvUnderloadCount," overloadCount =",self._pvOverloadCount, "Power to turnUp/Down = ",self.getPowerWallboxUp(newCurrent),"/",self.getPowerWallboxDown(newCurrent)," power =",power," = grid =",powerGrid," - wallbox =",powerWallbox," - battery = ",powerBattery, " - batteryExt = ",powerBatteryExt)
 
     #if newCurrent!=current:
     #	self._pvSetLoad(newCurrent, maxCurrent)
+    #print("Return newCurrent =",newCurrent )
     return newCurrent
 
   def _updateBattery(self, powerBattery, powerBatteryExt, powerBatteryMaxCharge):
@@ -424,83 +447,55 @@ class DbusGoeChargerService:
   	
   	logging.debug("WALLBOX::Update Status = %s Mode = %s External-StartStop = %s Current = %s A",status,mode,self._dbusservice['/ExternalStartStop'],self._dbusservice['/ExternalSetCurrent'])
 	
+  	if self._finishLoadCounter>0:
+  		self._finishLoadCounter = self._finishLoadCounter - 1
+       
 	# Car is connected
-  	if status==3 and self._dbusservice['/ExternalStartStop']==0: #Charging finished
-  		self._statusMessage = "[Status=3] Charging finished";
+  	if status==3 and (self._enableRestart==False and self._finishLoadCounter==0) and self._dbusservice['/ExternalStartStop']==0: #Charging finished
+  		self._statusMessage = "[Status=3] Charging finished [enableRestart="+str(self._enableRestart)+" counter="+str(self._restartCounter/self._restartCounterLimit*100)+"%]";
     
   		self._pvUnderloadCount = 0
   		self._pvOverloadCount = 0
-  		#self._pvSetLoad(0, maxCurrent)
+  		logging.info("WALLBOX::Auto finished")
   		if self._dbusservice['/ExternalStartStop']==0: #Externes Laden: Deaktiviert -> Reset Current to 16A 
   			self._pvSetLoad(0, maxCurrent)
   		#elif self._dbusservice['/ExternalSetCurrent']==0:					
   		#	self._pvSetLoad(0, maxCurrent)
-  	elif status!=0 or (status==3 and _enableRestart==True):
+  	elif status!=0 or (status==3 and (self._enableRestart==True or self._finishLoadCounter>0)):
+  		#if status!=3:
+  		#   self._enableRestart=False
+           
   		if mode==0:
   			self._statusMessage = "[Status = "+str(status)+"] Mode=0";
+  			self._enableRestart=True
   			logging.debug("WALLBOX::Manual Mode")
   		elif mode==1:
   			logging.debug("WALLBOX::Auto Mode")
+  			
+  			#if status!=3:
+  			#   self._enableRestart=False
+           
   			self._statusMessage = "[Status = "+str(status)+"] Mode=1";
-  			newCurrent = self._updatePVsurplusCharging(powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent)
-               
-  			'''
-			power = powerGrid - powerWallbox
-
-			if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
-				power = power + (self._maxPowerUnloadBatteryDuringCharging - powerBattery)
-			if powerBatteryExt < -self._maxPowerUnloadBatteryDuringChargingExt:
-				power = power + (self._maxPowerUnloadBatteryDuringChargingExt - powerBatteryExt)
-
-			if debug: 
-				print("Update _pvCount=",self._pvOverloadCount,"-",self._pvUnderloadCount," W power=",power," W (up ",self.getPowerWallboxUp(current)," down ",self.getPowerWallboxDown(current),") powerWallbox=",powerWallbox," W battery ", powerBattery, " W (",self._maxPowerUnloadBatteryDuringCharging," W) ext ",powerBatteryExt," W (",self._maxPowerUnloadBatteryDuringChargingExt," W)")
-
-			newCurrent = current
-
-			if self.getPowerWallboxUp(newCurrent)> power:
-				self._pvUnderloadCount = 0
-				self._pvOverloadCount = self._pvOverloadCount + 1
-			elif self.getPowerWallboxDown(newCurrent)< power:
-				self._pvOverloadCount = 0
-				if powerWallbox>0:
-					self._pvUnderloadCount = self._pvUnderloadCount + 1
-				else:
-					self._pvUnderloadCount = 0
-			else:
-				self._pvUnderloadCount = 0
-				self._pvOverloadCount = 0
-
-			if self._pvOverloadCount>=border:
-				self._pvOverloadCount = 0		
-				while newCurrent<maxCurrent and self.getPowerWallboxUp(newCurrent)> power:			
-					newCurrent = newCurrent+1
-
-				if debug: 
-					print("UP ",self.getPowerWallboxUp(newCurrent)," W > ",power," W")
-
-			if self._pvUnderloadCount>=border:
-				self._pvUnderloadCount = 0	
-				while newCurrent>6 and self.getPowerWallboxDown(newCurrent)< power:
-					newCurrent = newCurrent-1
-
-				if debug: 
-					print("Down ",self.getPowerWallboxDown(newCurrent)," W < ",power," W")
-
-			if debug: 
-				print("=> ",current," A -> ",newCurrent," A")
-  			'''		  
+            
+  			if self._dbusservice['/StartStop']==0: # Not Loading
+  			   current = 5
+            
+  			msgCurrent=""
+  			newCurrent = self._updatePVsurplusCharging(powerGrid, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent, msgCurrent)
+  			self._statusMessage = self._statusMessage + " newCurrent="+str(newCurrent)+" current="+str(current)+" msg="+msgCurrent;   
+  			
   			if newCurrent!=current:
   				#print("Set New Current")
   				if self._dbusservice['/ExternalStartStop']==0: # Externes Laden: Deaktiviert -> Set newCurrent 
   					if newCurrent>0:
-  					   logging.info("Activate Loadind");
+  					   logging.info("Activate Loading");
   					elif newCurrent==0:
-  					   logging.info("Deactivate Loading")
+  					   logging.info("Deactivate Loading [current=%s newCurrent=%s]" % (current,newCurrent))
   					self._pvSetLoad(newCurrent, maxCurrent, True)
   				elif self._dbusservice['/ExternalSetCurrent']==0:	 # Externes LAden: Aktiviert -> Set cureent ohne Ausschalten
   					#print("ABC")
   					if newCurrent>0:
-  						#print("ABCD")
+  						print("ExternalAktiv set current to ",newCurrent)
   						self._pvSetLoad(newCurrent, maxCurrent)
   				#else:
   					#print("ABEE ",self._dbusservice['/ExternalStartStop']," and ",self._dbusservice['/ExternalSetCurrent'])
@@ -510,11 +505,21 @@ class DbusGoeChargerService:
 		
   	else:
   		self._statusMessage = "[Status=0] No Car";
-        
+  		logging.info("Wallbox::CALL(_pvSetLoad: Stop Loading) -> no Car")
   		self._pvUnderloadCount = 0
   		self._pvOverloadCount = 0
   		self._pvSetLoad(0, maxCurrent)
-		
+	
+  	if status!=self._lastStatus:
+  	   self._lastStatus = status
+    
+  	if self._enableRestart==False:
+  	   self._restartCounter = self._restartCounter + 1
+  	else:
+  	   self._restartCounter = 0
+        
+  	if self._restartCounter > self._restartCounterLimit:
+  	   self._enableRestart = True
   	logging.debug("WALLBOX::Update ... end")
 			
   def _update(self): 
@@ -580,6 +585,7 @@ class DbusGoeChargerService:
           self._dbusservice['/Ac/Voltage'] = int(data['nrg'][0])
           self._dbusservice['/Current'] = max(data['nrg'][4] * 0.1, data['nrg'][5] * 0.1, data['nrg'][6] * 0.1)
           self._dbusservice['/Ac/Energy/Forward'] = int(float(data['eto']) / 10.0)
+          self._lastCurrentAvg = (data['nrg'][4] * 0.1 + data['nrg'][5] * 0.1 + data['nrg'][6] * 0.1)/3
           
           current = int(data['amp'])
           if current!=self._dbusservice['/SetCurrent']:
@@ -632,7 +638,9 @@ class DbusGoeChargerService:
 
           
           #action
+          #print("updatePV start")
           self._updatePV(status, mode,  gridPower, powerWallbox, powerBattery, powerBatteryExt, current, maxCurrent)
+          #print("updatePV end")
                   
           
                 
