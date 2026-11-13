@@ -45,9 +45,10 @@ class DbusGoeChargerService:
     self._nM_EndHour = config['NIGHTMODE'].getint('EndHour',6)
     self._nM_MaxExternalSOC = config['NIGHTMODE'].getfloat('MaxExternalSOC',50)
     self._nM_MinExternalSOC = config['NIGHTMODE'].getfloat('MinExternalSOC',20)
-    self._nM_MaxExternalCharge = config['NIGHTMODE'].getfloat('MaxExternalCharge',0)
+    self._nM_MaxExternalCharge = config['NIGHTMODE'].getint('MaxExternalCharge',0)
     self._nM_GridSetPoint = config['NIGHTMODE'].getfloat('GridSetPoint',50)
     self._nM_MaxDischarge = config['NIGHTMODE'].getfloat('MaxDischarge',50)
+    self._nM_MaxDischargeCurrent = self._nM_MaxDischarge
     
     self._dbusservice = VeDbusService("{}.http_{:02d}".format(servicename, deviceinstance),register=False)
     self._paths = paths
@@ -114,6 +115,8 @@ class DbusGoeChargerService:
     self._powerBatteryMaxDischarge_last = self._powerBatteryMaxDischarge_reset;
     self._socBattery = bus.get_object('com.victronenergy.vebus.ttyS4', '/Soc')
     self._socLimit = bus.get_object('com.victronenergy.system', '/Control/ActiveSocLimit')
+    self._dess_enable = bus.get_object('com.victronenergy.system', '/DynamicEss/Active')
+    self._dess_socTarget = bus.get_object('com.victronenergy.system', '/DynamicEss/TargetSoc')
     
     try:
        self._powerBatteryExt = bus.get_object('com.victronenergy.acsystem.VartaElement', '/Ac/In/1/P')
@@ -124,10 +127,14 @@ class DbusGoeChargerService:
        self._powerBatteryMaxDischargeExt_reset = self._powerBatteryMaxDischargeExt.GetValue()
        self._powerBatteryMaxDischargeExt_last = self._powerBatteryMaxDischargeExt_reset;
        self._socBatteryExt = bus.get_object('com.victronenergy.acsystem.VartaElement', '/Soc')
+       if self._powerBatteryMaxChargeExt_reset==0:
+          self._powerBatteryMaxChargeExt_reset = 4000
     except Exception:
        self._powerBatteryExt = None;
        self._powerBatteryMaxChargeExt = None;
+       self._powerBatteryMaxChargeExt_reset = 4000
        self._powerBatteryMaxDischargeExt = None;
+       self._powerBatteryMaxDischargeExt_reset = -4000
        self._socBatteryExt = None;
        
     #Charge/Invert Internal/External Battery
@@ -135,7 +142,7 @@ class DbusGoeChargerService:
     self._maxPowerUnloadBatteryExt = 0
     
     #Invert Internal/External Battery during Loading Car
-    self._minPowerLoadBatteryDuringCharging = 500
+    self._minPowerLoadBatteryDuringCharging = 700
     self._minPowerLoadBatteryDuringChargingExt = 500
     self._maxPowerUnloadBatteryDuringCharging = 0
     self._maxPowerUnloadBatteryDuringChargingExt = 0
@@ -165,6 +172,8 @@ class DbusGoeChargerService:
     self._batteryReduceloadCount = 0
     self._batteryIncreaseloadCount = 0
     self._batteryCount = 0
+    
+    self._AcEnergyForward = None
     
     # last update
     self._lastUpdate = 0
@@ -273,6 +282,7 @@ class DbusGoeChargerService:
  
  
   def _signOfLife(self):
+    """
     logging.info("--- Start: sign of life ---")
     logging.info("Last _update() call: %s" % (self._lastUpdate))
     logging.info("Last '/Ac/Power': %s" % (self._dbusservice['/Ac/Power']))
@@ -285,6 +295,7 @@ class DbusGoeChargerService:
     logging.info("Last 'lastCurrentAvg': %s" % (self._lastCurrentAvg))
     logging.info("Last 'statusMessage': %s" % (self._statusMessage))
     logging.info("--- End: sign of life ---")
+    """
     return True
   
   def _evCharger2GoeMode(self, mode):
@@ -307,16 +318,23 @@ class DbusGoeChargerService:
         return 1
         
   def reset(self):
-     logging.info("BATT::Reset maxCharge= %s W maxDischarge= %s W",self._powerBatteryMaxCharge_reset,self._powerBatteryMaxDischarge_reset)
+     logging.info("BATT::Reset maxCharge= %s W maxDischarge= %s W gridSetPoint= %s W",self._powerBatteryMaxCharge_reset,self._powerBatteryMaxDischarge_reset, self._gridGridSetPoint_reset)
+     logging.info("BATTExternal::Reset maxCharge= %s W maxDischarge= %s W",self._powerBatteryMaxChargeExt_reset,self._powerBatteryMaxDischargeExt_reset)
      self._powerBatteryMaxCharge.SetValue(self._powerBatteryMaxCharge_reset)
      self._powerBatteryMaxDischarge.SetValue(self._powerBatteryMaxDischarge_reset)
-     logging.info("BATT::Ext::Reset not necessary because timeout")
+     self._gridGridSetPoint.SetValue(self._gridGridSetPoint_reset)
+     self._powerBatteryMaxChargeExt.SetValue(self._powerBatteryMaxChargeExt_reset)
+     self._powerBatteryMaxDischargeExt.SetValue(self._powerBatteryMaxDischargeExt_reset)
   
   def _batterySetExternalUnload(self, power, maxPower):
     if power>0:
        power = 0
     if power<self._powerBatteryMaxDischargeExt_reset:
        power = self._powerBatteryMaxDischargeExt_reset
+    
+    if self._powerBatteryMaxDischargeExt_last!=self._powerBatteryMaxDischargeExt.GetValue():
+       self._powerBatteryMaxDischargeExt_last = self._powerBatteryMaxDischargeExt_reset
+       return
     
     print("CALL::batterySetExternalUnload power = ",power," maxPower = ",maxPower)    
     if power!=maxPower:
@@ -359,13 +377,13 @@ class DbusGoeChargerService:
         
   def _gridSetGridSetPoint(self, value, last):
     if value!=last:
-        self._socBatteryExt_last = value
-        self._socBatteryExt.SetValue(value)
+        self._gridGridSetPoint_last = value
+        self._gridGridSetPoint.SetValue(value)
         
   def _gridResetGridSetPoint(self, value):
-    if value!=self._socBatteryExt_reset:
-        self._socBatteryExt_last = self._socBatteryExt_reset
-        self._socBatteryExt.SetValue(self._socBatteryExt_reset)
+    if value!=self._gridGridSetPoint_reset:
+        self._gridGridSetPoint_last = self._gridGridSetPoint_reset
+        self._gridGridSetPoint.SetValue(self._gridGridSetPoint_reset)
         
   def _pvSetLoad(self, current, currentMax, enableRestart = False):
     #print("_pvSetLoad(",current," A, ",currentMax," A)")
@@ -393,10 +411,10 @@ class DbusGoeChargerService:
           self._dbusservice['/SetCurrent'] = current   
           self._setGoeChargerValue('amp', current)
        if self._dbusservice['/StartStop']==0:
-          logging.info("Wallbox::Start Loading") 
           self._finishLoadCounter = 30
           self._dbusservice['/StartStop'] = 1  
           self._setGoeChargerValue('alw', 1)
+          logging.info("Wallbox::Start Loading /StartStop = %s =? 1",self._dbusservice['/StartStop']) 
           if enableRestart: # -> change with status
              self._enableRestart = False
   
@@ -430,8 +448,10 @@ class DbusGoeChargerService:
     #print("_updatePVsurplusCharging")
     border = 30
     debug = True
+    
     power = powerGrid - powerWallbox - (0,powerBattery - self._minPowerLoadBatteryDuringCharging)[powerBattery>0] - (0, powerBatteryExt - self._minPowerLoadBatteryDuringChargingExt)[powerBatteryExt>0]
-		
+    #print("Power ",power,"=",powerGrid," - ",powerWallbox," - (0,",powerBattery - self._minPowerLoadBatteryDuringCharging,")[",powerBattery,">0] - (0, ",powerBatteryExt - self._minPowerLoadBatteryDuringChargingExt,")[",powerBatteryExt,">0])");
+	
     if powerBattery < -self._maxPowerUnloadBatteryDuringCharging:
     	power = power + (self._maxPowerUnloadBatteryDuringCharging - powerBattery)
     if powerBatteryExt < -self._maxPowerUnloadBatteryDuringChargingExt:
@@ -503,16 +523,25 @@ class DbusGoeChargerService:
     #print("Return newCurrent =",newCurrent )
     return newCurrent
 
-  def _updateBattery(self, gridPower, gridGridSetPoint, powerBattery, powerBatteryExt, powerBatteryMaxCharge, powerBatteryMaxDischarge, powerBatteryMaxChargeExt, powerBatteryMaxDischargeExt, socBattery, socBatteryExt, socBatteryLimit):
+  def getDeltaSoc(self, capacity, rate, offset):
+    return (rate+offset)*100/capacity
+
+  def getDeltaMaxRate(self, capacity, soc, time, offset):
+    return (capacity/100*soc)/time - offset
+    
+  def _updateBattery(self, gridPower, gridGridSetPoint, powerBattery, powerBatteryExt, powerBatteryMaxCharge, powerBatteryMaxDischarge, powerBatteryMaxChargeExt, powerBatteryMaxDischargeExt, socBattery, socBatteryExt, socBatteryLimit, socTargetBattery):
     border = 15
     borderZeroBattery = 100
     #debug = False
+    #print("socTargetBattery = ",socTargetBattery)
     
     logging.debug("BATT::Update _batterCount= %s BatteryAvg = %s W BatteryExtAvg = %s W Battery = %s W BatteryExt = %s W",self._batteryCount,int(self._powerBatteryAvg),int(self._powerBatteryExtAvg), int(powerBattery),int(powerBatteryExt));
        
     
     if self._batteryCount>=border:
         self._batteryCount = 0
+        print("External::Charge ",powerBatteryMaxChargeExt," W reset=",self._powerBatteryMaxChargeExt_reset," W")
+        print("External::Discharge ",powerBatteryMaxDischargeExt," W reset=",self._powerBatteryMaxDischargeExt_reset," W")
         #print("_DisableDischargeAtPower = ",self._DisableDischargeAtPower," ",self._DisableExternalDischargeAtPower);
         if self._DisableDischargeAtPower is not None:
             print("Battery::DisableDischargeAtPower = ",self._DisableDischargeAtPower, self._gridPowerAvg)
@@ -539,26 +568,35 @@ class DbusGoeChargerService:
                  hourGap = self._nM_EndHour - now.hour
                  
               print("NightMode::Check Discharge Time SOC ",socBattery," Limit ",socBatteryLimit," = ",(socBattery - socBatteryLimit)/5,"h current Gap = ",hourGap,"h")
-              if (socBattery - socBatteryLimit)/5 >= hourGap:
+              if (socBattery - socBatteryLimit)/self.getDeltaSoc(16000, self._nM_MaxDischarge, 50) >= hourGap:
+                 value = self.getDeltaMaxRate(16000, socBattery - socBatteryLimit, hourGap, 50) 
+                 self._nM_MaxDischargeCurrent = max(min(value, self._powerBatteryMaxCharge_reset), self._nM_MaxDischarge)
                  self._nightMode = True
         else:
-           print("NightMode::Deactivate Zeit ",now.hour," Start ",self._nM_StartHour," Ende SOC ",socBattery," <= ",socBatteryLimit)
-           if (now.hour < self._nM_StartHour and now.hour >= self._nM_EndHour) or socBattery <= socBatteryLimit:
+           print("NightMode::Deactivate Zeit ",now.hour," Start ",self._nM_StartHour," Ende SOC ",socBattery," <= ",socBatteryLimit," Ende ExtSOC ",socBatteryExt," == 0")
+           if (now.hour < self._nM_StartHour and now.hour >= self._nM_EndHour) or socBattery <= socBatteryLimit or socBatteryExt==0:
               self._nightMode = False
               self._batterySetExternalLoad(self._powerBatteryMaxChargeExt_reset, powerBatteryMaxChargeExt)
               self._batterySetUnload(self._powerBatteryMaxCharge_reset, powerBatteryMaxDischarge)
               self._gridResetGridSetPoint(gridGridSetPoint)
         
         if self._nightMode:
+            print("Nightmode Set External Load to ",self._nM_MaxExternalCharge," [",powerBatteryMaxChargeExt,"]");
             self._batterySetExternalLoad(self._nM_MaxExternalCharge, powerBatteryMaxChargeExt)
+            print("Nightmode Set Unload to ",self._nM_MaxDischarge," [",powerBatteryMaxDischarge,"]");
             self._batterySetUnload(self._nM_MaxDischarge, powerBatteryMaxDischarge)
+            print("Nightmode Set Gridpoint to ",self._nM_GridSetPoint," [",gridGridSetPoint,"]");
             self._gridSetGridSetPoint(self._nM_GridSetPoint, gridGridSetPoint)
         else:        
+            #self._batterySetExternalLoad(self._powerBatteryMaxChargeExt_reset, powerBatteryMaxChargeExt)
             if self._powerBatteryAvg > borderZeroBattery and self._powerBatteryExtAvg<self._maxPowerUnloadBatteryExt:
-                #Reduce Load
-                value = round((self._powerBatteryAvg + (self._powerBatteryExtAvg))/100+0.5,0)*100
-                logging.info("BATT::[batteryAvg=%s W batteryExtAvg=%s W]\tReduce max. charge rate to %s W",int(self._powerBatteryAvg), int(self._powerBatteryExtAvg),(value))
-                self._batterySetLoad(value, powerBatteryMaxCharge)
+                if socTargetBattery < socBattery:
+                   #Reduce Load
+                   value = round((self._powerBatteryAvg + (self._powerBatteryExtAvg))/100+0.5,0)*100
+                   logging.info("BATT::[batteryAvg=%s W batteryExtAvg=%s W]\tReduce max. charge rate to %s W",int(self._powerBatteryAvg), int(self._powerBatteryExtAvg),(value))
+                   self._batterySetLoad(value, powerBatteryMaxCharge)
+                else:
+                   print("ToDo: reduce external unload because DESS Charge of Battery?")
             elif self._powerBatteryExtAvg>=0 and powerBatteryMaxCharge<self._powerBatteryMaxCharge_reset:
                 #Reset Load when Ext Battery Charging
                 #if powerBatteryExt > 1000:
@@ -623,9 +661,11 @@ class DbusGoeChargerService:
   				#print("Set New Current")
   				if self._dbusservice['/ExternalStartStop']==0: # Externes Laden: Deaktiviert -> Set newCurrent 
   					if newCurrent>0:
-  					   logging.info("Activate Loading");
+  					   logging.info("WALLBOX::[Status = %s]::Activate Loading" % (status));
   					elif newCurrent==0:
-  					   logging.info("Deactivate Loading [current=%s newCurrent=%s]" % (current,newCurrent))
+  					   logging.info("WALLBOX::[Status = %s]::Deactivate Loading [current=%s newCurrent=%s]" % (status,current,newCurrent))
+  					else:
+  					   logging.info("WALLBOX::[Status = %s]::Strange" % (status));
   					self._pvSetLoad(newCurrent, maxCurrent, True)
   				elif self._dbusservice['/ExternalSetCurrent']==0:	 # Externes LAden: Aktiviert -> Set cureent ohne Ausschalten
   					#print("ABC")
@@ -640,7 +680,7 @@ class DbusGoeChargerService:
 		
   	else:
   		self._statusMessage = "[Status=0] No Car";
-  		#logging.info("Wallbox::CALL(_pvSetLoad: Stop Loading) -> no Car")
+  		logging.info("Wallbox::[Status = %s]::CALL(_pvSetLoad: Stop Loading) -> no Car", status)
   		self._pvUnderloadCount = 0
   		self._pvOverloadCount = 0
   		self._pvSetLoad(0, maxCurrent)
@@ -656,7 +696,14 @@ class DbusGoeChargerService:
   	if self._restartCounter > self._restartCounterLimit:
   	   self._enableRestart = True
   	logging.debug("WALLBOX::Update ... end")
-			
+	
+  def _updateWP(self):
+     # https://community.home-assistant.io/t/integration-of-heat-pump-thz-5-5-eco-from-tecalor-stiebel-eltron-into-home-assistant/447298/16
+     # https://github.com/andig/canprogs/tree/5f7433533b7d16aeb6f70c020209f1ccf834d5a6
+     print("ToDo: https://waermepumpesolar.com/ratgeber/hybrid-sg-ready-schnittstelle-waermepumpe-pv -> https://github.com/bullitt186/ha-stiebel-control/blob/main/SG_READY.md")
+     print("Zustaende mind. 10 min halten, WP sperren max 2 Stunden am Stück und max 3 mal am Tag")
+     print("Zustand 3 ab 1 KW, Zustand 4 ab 3 KW")
+    
   def _update(self): 
     self._frame = self._frame + 1;
     #print("[",self._frame,"] Start")
@@ -678,6 +725,12 @@ class DbusGoeChargerService:
        powerBatteryMaxDischarge = self._powerBatteryMaxDischarge.GetValue()
        socBattery = self._socBattery.GetValue()
        socBatteryLimit = self._socLimit.GetValue()
+       dessEnableBattery = self._dess_enable.GetValue()
+       dessSocTargetBattery = self._dess_socTarget.GetValue()
+       #print("TargetSOC = [",self._dess_socTarget.GetText(),"]")
+       if not dessSocTargetBattery:
+          #print("-> Empty")
+          dessSocTargetBattery = 0
     except Exception as e:
        logging.critical('Error at _update: Reconnect GridMeter')
        try:
@@ -733,9 +786,12 @@ class DbusGoeChargerService:
           self._gridGridSetPoint_reset = gridGridSetPoint
           logging.info("Set GridSetPoint value by reset to %s W" % (gridGridSetPoint))
        
+       if dessEnableBattery==0:
+          dessSocTargetBattery = 0
+       
        #Action
        #print("[",self._frame,"] Update Battery") 
-       self._updateBattery(gridPower, gridGridSetPoint, powerBattery, powerBatteryExt, powerBatteryMaxCharge, powerBatteryMaxDischarge, powerBatteryMaxChargeExt, powerBatteryMaxDischargeExt, socBattery, socBatteryExt, socBatteryLimit)
+       self._updateBattery(gridPower, gridGridSetPoint, powerBattery, powerBatteryExt, powerBatteryMaxCharge, powerBatteryMaxDischarge, powerBatteryMaxChargeExt, powerBatteryMaxDischargeExt, socBattery, socBatteryExt, socBatteryLimit, dessSocTargetBattery)
 		  
        
        if data is not None:
@@ -777,7 +833,11 @@ class DbusGoeChargerService:
           self._dbusservice['/Ac/Power'] = powerWallbox
           self._dbusservice['/Ac/Voltage'] = int(data['nrg'][0])
           self._dbusservice['/Current'] = max(data['nrg'][4] * 0.1, data['nrg'][5] * 0.1, data['nrg'][6] * 0.1)
-          self._dbusservice['/Ac/Energy/Forward'] = int(float(data['eto']) / 10.0)
+          if self._AcEnergyForward is None:
+             if float(data['eto'])>0:
+                self._AcEnergyForward = int(float(data['eto']) / 10.0);
+          else:
+             self._dbusservice['/Ac/Energy/Forward'] = int(float(data['eto']) / 10.0) - self._AcEnergyForward
           self._lastCurrentAvg = (data['nrg'][4] * 0.1 + data['nrg'][5] * 0.1 + data['nrg'][6] * 0.1)/3
           
           current = int(data['amp'])
@@ -819,16 +879,22 @@ class DbusGoeChargerService:
 
           
           # value 'car' 1: charging station ready, no vehicle 2: vehicle loads 3: Waiting for vehicle 4: Charge finished, vehicle still connected
-          status = 0
-          if int(data['car']) == 1:
-            status = 0
-          elif int(data['car']) == 2:
+          status = -1
+          if int(data['car']) == 1:     # Idle
+            status = 2 # Hold old Value
+          elif int(data['car']) == 2:   # Charging
             status = 2
-          elif int(data['car']) == 3:
+          elif int(data['car']) == 3:   # WaitCar
             status = 6
-          elif int(data['car']) == 4:
+          elif int(data['car']) == 4:   # Complete
             status = 3
-          self._dbusservice['/Status'] = status
+          #elif int(data['car']) == 5:   # Error
+          #  status = 7
+            
+          #logging.info("STATUS = %s (%s)" % (status, int(data['car'])))
+            
+          if status>-1:
+             self._dbusservice['/Status'] = status
 
           
           #action
